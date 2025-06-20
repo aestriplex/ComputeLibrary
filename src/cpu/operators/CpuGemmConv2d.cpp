@@ -154,6 +154,11 @@ void initialize_reshaped_weight_info(const ITensorInfo &weights, ITensorInfo &re
 }
 } // namespace
 
+bool CpuGemmConv2d::is_dequantization_required(const ITensorInfo *dst)
+{
+    return _is_quantized && dst->data_type() == DataType::F32;
+}
+
 CpuGemmConv2d::WeightTransformMethod CpuGemmConv2d::get_wt_method(const ITensorInfo &weights)
 {
     // TODO: Extend ReinterpretThenTranspose support for quantized data types COMPMID-6596
@@ -216,6 +221,9 @@ CpuGemmConv2d::CpuGemmConv2d()
       _mm_gemmlowp(),
       _col2im_kernel(),
       _reshape(),
+      _dequantize_mid_layer(),
+      _reshape_mid_layer(),
+      _dequantize(),
       _im2col_output(),
       _weights_reshaped(),
       _gemm_output(),
@@ -504,7 +512,29 @@ void CpuGemmConv2d::configure(const ITensorInfo         *src,
     const unsigned int mat_weights_cols = weights->dimension(idx_kernels);
 
     // Create temporary GEMM output tensor in case we cannot skip col2im
-    const DataType output_data_type = data_type == DataType::BFLOAT16 ? DataType::F32 : data_type;
+    DataType output_data_type = data_type == DataType::BFLOAT16 ? DataType::F32 : data_type;
+
+    // If the output is quantized we should use dst
+    ITensorInfo *output_to_use = dst;
+
+    if (is_dequantization_required(dst))
+    {
+        // If we need a dequantized output, we use a tensor of the same type of the input QASYMM8/QASYMM8_SIGNED.
+        _dequantize_mid_layer = std::make_unique<Tensor>();
+        _dequantize_mid_layer->allocator()->init(TensorInfo(dst->tensor_shape(), 1, src->data_type()));
+        _dequantize_mid_layer->info()->set_quantization_info(src->quantization_info());
+        _dequantize_mid_layer->allocator()->allocate();
+
+        // For the reshape, we cannot write directly on dst, since we still need to perform the dequantization after that
+        _reshape_mid_layer = std::make_unique<Tensor>();
+        _reshape_mid_layer->allocator()->init(TensorInfo(dst->tensor_shape(), 1, src->data_type()));
+        _reshape_mid_layer->info()->set_quantization_info(src->quantization_info());
+        _reshape_mid_layer->allocator()->allocate();
+
+        output_to_use = _dequantize_mid_layer->info();
+        output_data_type = DataType::F32;
+    }
+
     if (!_skip_col2im)
     {
         TensorShape shape_gemm;
@@ -515,7 +545,7 @@ void CpuGemmConv2d::configure(const ITensorInfo         *src,
         shape_gemm.set(1, conv_w * conv_h);
 
         _gemm_output = TensorInfo(shape_gemm, 1, output_data_type);
-        _gemm_output.set_quantization_info(dst->quantization_info()).set_data_layout(src->data_layout());
+        _gemm_output.set_quantization_info(output_to_use->quantization_info()).set_data_layout(src->data_layout());
         _gemm_output_3d = TensorInfo(_gemm_output);
 
         // Update GEMM output
@@ -523,7 +553,7 @@ void CpuGemmConv2d::configure(const ITensorInfo         *src,
     }
     else
     {
-        _gemm_output_3d = TensorInfo(*dst);
+        _gemm_output_3d = TensorInfo(*output_to_use);
         _gemm_output_3d.set_data_type(output_data_type).set_data_layout(src->data_layout()).set_is_resizable(true);
         _gemm_output = TensorInfo(_gemm_output_3d);
 
@@ -571,13 +601,13 @@ void CpuGemmConv2d::configure(const ITensorInfo         *src,
     {
         // Configure col2im
         _col2im_kernel = std::make_unique<kernels::CpuCol2ImKernel>();
-        _col2im_kernel->configure(gemm_output_to_use, dst, Size2D(conv_w, conv_h));
+        _col2im_kernel->configure(gemm_output_to_use, output_to_use, Size2D(conv_w, conv_h));
     }
     else
     {
         // Configure reshape layer
         _reshape = std::make_unique<CpuReshape>();
-        _reshape->configure(gemm_output_to_use, dst);
+        _reshape->configure(gemm_output_to_use, output_to_use);
     }
 
     // Check lifetime
@@ -608,6 +638,12 @@ void CpuGemmConv2d::configure(const ITensorInfo         *src,
                                                _weights_reshaped.total_size());
     }
     _aux_mem[GemmOutput] = MemoryInfo(offset_int_vec(GemmOutput), MemoryLifetime::Temporary, _gemm_output.total_size());
+
+    if (is_dequantization_required(dst))
+    {
+        _dequantize = std::make_unique<CpuDequantize>();
+        _dequantize->configure(_dequantize_mid_layer->info(), dst);
+    }
 }
 
 Status CpuGemmConv2d::has_opt_impl(arm_compute::WeightFormat &expected_weight_format,
@@ -901,6 +937,10 @@ void CpuGemmConv2d::run(ITensorPack &tensors)
     {
         gemm_output_to_use = dst;
     }
+    if (is_dequantization_required(dst->info()))
+    {
+        gemm_output_to_use = _dequantize_mid_layer.get();
+    }
 
     ITensorPack gemm_pack = tensors;
     gemm_pack.add_const_tensor(TensorType::ACL_SRC_0, gemm_input_to_use);
@@ -934,24 +974,35 @@ void CpuGemmConv2d::run(ITensorPack &tensors)
     // Runs CpuGemm or CpuGemmLowpMatrixMultiplyCore functions
     _is_quantized ? _mm_gemmlowp->run(gemm_pack) : _mm_gemm->run(gemm_pack);
 
+    ITensor *reshape_output = is_dequantization_required(dst->info()) ? _reshape_mid_layer.get() : dst;
+
     // Reshape output matrix
     if (!_skip_col2im)
     {
         if (_data_layout == DataLayout::NCHW)
         {
-            ITensorPack pack = {{TensorType::ACL_SRC, gemm_output.get()}, {TensorType::ACL_DST, dst}};
+            ITensorPack pack = {{TensorType::ACL_SRC, gemm_output_to_use}, {TensorType::ACL_DST, reshape_output}};
             NEScheduler::get().schedule_op(_col2im_kernel.get(), Window::DimY, _col2im_kernel->window(), pack);
         }
         else
         {
-            ITensorPack pack = {{TensorType::ACL_SRC, gemm_output_to_use}, {TensorType::ACL_DST, dst}};
+            ITensorPack pack = {{TensorType::ACL_SRC, gemm_output_to_use}, {TensorType::ACL_DST, reshape_output}};
             _reshape->run(pack);
         }
     }
     else if (out_has_padding)
     {
-        ITensorPack pack = {{TensorType::ACL_SRC, gemm_output_to_use}, {TensorType::ACL_DST, dst}};
+        ITensorPack pack = {{TensorType::ACL_SRC, gemm_output_to_use}, {TensorType::ACL_DST, reshape_output}};
         _reshape->run(pack);
+    }
+
+    if (is_dequantization_required(dst->info()))
+    {
+        ITensorPack dequant_pack = {
+            {TensorType::ACL_SRC, _reshape_mid_layer.get()},
+            {TensorType::ACL_DST, dst}
+        };
+        _dequantize->run(dequant_pack);
     }
 }
 

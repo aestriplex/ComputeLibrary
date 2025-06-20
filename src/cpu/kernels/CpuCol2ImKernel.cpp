@@ -54,8 +54,19 @@ Status validate_arguments(const ITensorInfo *src, const ITensorInfo *dst, const 
     {
         ARM_COMPUTE_RETURN_ERROR_ON_MISMATCHING_DIMENSIONS(dst->tensor_shape(),
                                                            compute_col2im_shape(*src, convolved_dims, false));
-        ARM_COMPUTE_RETURN_ERROR_ON_MISMATCHING_DATA_TYPES(src, dst);
-        ARM_COMPUTE_RETURN_ERROR_ON_MISMATCHING_QUANTIZATION_INFO(src, dst);
+        // Allow dequantization: int8/uint8 -> F32
+        const auto src_dt = src->data_type();
+        const auto dst_dt = dst->data_type();
+        if (!((src_dt == dst_dt) ||
+              ((src_dt == DataType::QASYMM8 || src_dt == DataType::QASYMM8_SIGNED) && dst_dt == DataType::F32)))
+        {
+            return Status{ ErrorCode::RUNTIME_ERROR, "Unsupported input/output data type combination for dequantized Col2Im." };
+        }
+        // Only check quantization info if both are quantized
+        if (is_data_type_quantized(src_dt) && is_data_type_quantized(dst_dt))
+        {
+            ARM_COMPUTE_RETURN_ERROR_ON_MISMATCHING_QUANTIZATION_INFO(src, dst);
+        }
     }
 
     return Status{};

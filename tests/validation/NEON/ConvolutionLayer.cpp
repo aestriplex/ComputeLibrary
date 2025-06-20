@@ -25,6 +25,7 @@
 #include "arm_compute/runtime/NEON/functions/NEConvolutionLayer.h"
 #include "arm_compute/runtime/NEON/functions/NEGEMMConv2d.h"
 #include "arm_compute/runtime/NEON/functions/NEGEMMConvolutionLayer.h"
+#include "arm_compute/runtime/NEON/functions/NEDequantizationLayer.h"
 #include "arm_compute/runtime/NEON/functions/NEWinogradConvolutionLayer.h"
 #include "arm_compute/runtime/Tensor.h"
 #include "arm_compute/runtime/TensorAllocator.h"
@@ -147,39 +148,59 @@ DATA_TEST_CASE(SupportedTypes, framework::DatasetMode::ALL, zip(
                     DataType::F32,
                     DataType::QASYMM8,
                     DataType::QASYMM8,
+                    DataType::QASYMM8_SIGNED,
+                    DataType::QASYMM8,
                     DataType::QASYMM8_SIGNED
                 }),
                 make("WeightsDataType", {
                     DataType::F32,
                     DataType::QASYMM8,
                     DataType::QASYMM8_SIGNED,
-                    DataType::QASYMM8
+                    DataType::QASYMM8,
+                    DataType::QASYMM8,
+                    DataType::QASYMM8_SIGNED
+                }),
+                make("OutputDataType", {
+                    DataType::F32,
+                    DataType::QASYMM8,
+                    DataType::QASYMM8,
+                    DataType::QASYMM8_SIGNED,
+                    DataType::F32,
+                    DataType::F32
                 }),
                 make("Expected",
                 {
                     true,
                     true,
                     true,
-                    false
+                    false,
+                    true,
+                    true
                 })),
-data_type_const, weights_data_type_const, expected_const)
+data_type_const, weights_data_type_const, output_data_type_const, expected_const)
 {
     TensorInfo input_info   = TensorInfo(TensorShape(3U, 3U, 1U), 1, data_type_const);
     TensorInfo weights_info = TensorInfo(TensorShape(2U, 2U, 1U, 1U), 1, weights_data_type_const);
-    TensorInfo output_info  = TensorInfo(TensorShape(2U, 2U, 1U), 1, data_type_const);
+    TensorInfo output_info  = TensorInfo(TensorShape(2U, 2U, 1U), 1, output_data_type_const);
 
     input_info.set_quantization_info(arm_compute::QuantizationInfo(1, 0));
     weights_info.set_quantization_info(arm_compute::QuantizationInfo(1, 0));
     output_info.set_quantization_info(arm_compute::QuantizationInfo(1, 0));
 
-    Status status = NEConvolutionLayer::validate(
+    Status status_NE = NEConvolutionLayer::validate(
+                        &input_info,
+                        &weights_info,
+                        nullptr,
+                        &output_info,
+                        PadStrideInfo());
+    Status status_NEGEMM = NEGEMMConvolutionLayer::validate(
                         &input_info,
                         &weights_info,
                         nullptr,
                         &output_info,
                         PadStrideInfo());
 
-    ARM_COMPUTE_EXPECT(bool(status) == expected_const, framework::LogLevel::ERRORS);
+    ARM_COMPUTE_EXPECT(bool(status_NE) == expected_const && bool(status_NEGEMM) == expected_const, framework::LogLevel::ERRORS);
 }
 
 // *INDENT-OFF*
@@ -1220,6 +1241,96 @@ TEST_CASE(MemoryInjection, framework::DatasetMode::ALL)
     {
         ARM_COMPUTE_EXPECT(reinterpret_cast<float *>(result_0.buffer())[i] == reinterpret_cast<float *>(result_1.buffer())[i], framework::LogLevel::ERRORS);
     }
+}
+
+TEST_CASE(ConfigureCpuGemmConv2dWithDequantizedOutput, framework::DatasetMode::ALL)
+{
+    auto        conv        = std::make_unique<cpu::CpuGemmConv2d>();
+    const auto  src_info    = TensorInfo(TensorShape(1U, 5U, 2U), 1, DataType::QASYMM8, DataLayout::NCHW);
+    const auto  weight_info = TensorInfo(TensorShape(1U, 3U, 2U, 3U), 1, DataType::QASYMM8, DataLayout::NCHW);
+    auto        dst_info    = TensorInfo(TensorShape(1U, 7U, 3U), 1, DataType::F32, DataLayout::NCHW);
+    const auto  conv_info   = PadStrideInfo(1, 1, 0, 0, 2, 2, DimensionRoundingType::FLOOR);
+    WeightsInfo weights_info(false, 3U, 3U, 1U);
+    conv->configure(&src_info, &weight_info, nullptr, &dst_info, conv_info, weights_info);
+
+    // tensors are newly created every call of this lambda function
+    auto src    = create_tensor<Tensor>(src_info);
+    auto weight = create_tensor<Tensor>(weight_info);
+    src.allocator()->allocate();
+    weight.allocator()->allocate();
+
+    ITensorPack run_pack{ { TensorType::ACL_SRC_0, &src }, { TensorType::ACL_SRC_1, &weight } };
+    ITensorPack prep_pack{ { TensorType::ACL_SRC_1, &weight } };
+
+    auto mg = MemoryGroup{};
+    auto ws = manage_workspace<Tensor>(conv->workspace(), mg, run_pack, prep_pack);
+
+    auto run_conv = [&]() -> Tensor
+    {
+        auto dst = create_tensor<Tensor>(dst_info);
+        dst.allocator()->allocate();
+        run_pack.add_tensor(TensorType::ACL_DST, &dst);
+
+        library->fill_tensor_value(Accessor(src), 1.f);
+        library->fill_tensor_value(Accessor(weight), 2.f);
+        // This operator is configured once and captured by this lambda.
+        conv->prepare(prep_pack);
+        conv->run(run_pack);
+        return dst;
+    };
+    auto result_0 = run_conv();
+    auto result_1 = run_conv();
+    for(size_t i = 0; i < result_0.info()->tensor_shape().total_size(); ++i)
+    {
+        ARM_COMPUTE_EXPECT(reinterpret_cast<float *>(result_0.buffer())[i] == reinterpret_cast<float *>(result_1.buffer())[i], framework::LogLevel::ERRORS);
+    }
+}
+
+TEST_CASE(ConvolutionLayerWithDequantizedOutput, framework::DatasetMode::ALL)
+{
+    TensorShape shape(5U, 5U, 3U);
+    TensorShape weights_shape(3U, 3U, 3U, 2U);
+    QuantizationInfo qinfo(1.0f, 1);
+
+    Tensor src_q = create_tensor<Tensor>(shape, DataType::QASYMM8, 1, qinfo);
+    Tensor weights_q = create_tensor<Tensor>(weights_shape, DataType::QASYMM8, 1, qinfo);
+    Tensor dst_q = create_tensor<Tensor>(shape, DataType::QASYMM8, 1, qinfo);
+
+    src_q.allocator()->allocate();
+    weights_q.allocator()->allocate();
+    dst_q.allocator()->allocate();
+
+    library->fill_tensor_uniform(Accessor(src_q), 0);
+    library->fill_tensor_uniform(Accessor(weights_q), 1);
+
+    // Convolution with quantized input and output
+    NEConvolutionLayer conv_q;
+    conv_q.configure(&src_q, &weights_q, nullptr, &dst_q, PadStrideInfo(1, 1, 0, 0));
+    conv_q.run();
+
+    Tensor dst_f32_ref = create_tensor<Tensor>(shape, DataType::F32, 1);
+    dst_f32_ref.allocator()->allocate();
+
+    // Dequantization DataType::QASYMM8 -> DataType::F32
+    NEDequantizationLayer deq;
+    deq.configure(&dst_q, &dst_f32_ref);
+    deq.run();
+
+    // Expected result
+    const TensorInfo &info = dst_f32_ref.info()->clone()->set_is_resizable(false);
+    SimpleTensor<float> ref(info.tensor_shape(), DataType::F32);
+    std::memcpy(ref.data(), dst_f32_ref.buffer(), dst_f32_ref.info()->total_size());
+
+    Tensor dst_f32_test = create_tensor<Tensor>(shape, DataType::F32, 1);
+    dst_f32_test.allocator()->allocate();
+    std::memset(dst_f32_test.buffer(), 0, dst_f32_test.info()->total_size());
+
+    // Convolution with quantized input and dequantized output
+    NEConvolutionLayer conv_f32;
+    conv_f32.configure(&src_q, &weights_q, nullptr, &dst_f32_test, PadStrideInfo(1, 1, 0, 0));
+    conv_f32.run();
+
+    validate(Accessor(dst_f32_test), ref, abs_tolerance_f32);
 }
 
 /** Test case for memory injection in @ref NEGEMMConvolutionLayer.

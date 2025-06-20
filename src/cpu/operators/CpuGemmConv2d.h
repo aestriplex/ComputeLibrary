@@ -27,8 +27,10 @@
 #include "arm_compute/core/TensorInfo.h"
 #include "arm_compute/core/Types.h"
 #include "arm_compute/function_info/ActivationLayerInfo.h"
+#include "arm_compute/runtime/Tensor.h"
 
 #include "src/cpu/ICpuOperator.h"
+#include "src/cpu/operators/CpuDequantize.h"
 
 #include <memory>
 
@@ -179,6 +181,13 @@ private:
                       int                        gemm_3d_depth    = 1,
                       bool                       fixed_format     = false,
                       arm_compute::WeightFormat  weight_format    = arm_compute::WeightFormat::UNSPECIFIED);
+	/**
+	 *
+	 * @param[in] dst Output tensor
+	 *
+	 * @return true if the the input is quantized and the ouput needs to be dequantized; false otherwise
+	 */
+	bool is_dequantization_required(const ITensorInfo *dst);
     /** Static function to check if given info will lead to a valid configuration of @ref NEGEMMConvolutionLayer matrix multiply routines
      *
      * @param[in] src              Input tensor info. Data types supported: QASYMM8/QASYMM8_SIGNED/BFLOAT16/F16/F32.
@@ -285,6 +294,9 @@ private:
     std::unique_ptr<CpuGemmLowpMatrixMultiplyCore>    _mm_gemmlowp;
     std::unique_ptr<kernels::CpuCol2ImKernel>         _col2im_kernel;
     std::unique_ptr<CpuReshape>                       _reshape;
+    std::unique_ptr<Tensor>                           _dequantize_mid_layer;
+    std::unique_ptr<Tensor>                           _reshape_mid_layer;
+	std::unique_ptr<CpuDequantize>                    _dequantize;
 
     TensorInfo _im2col_output;
     TensorInfo _weights_reshaped;
